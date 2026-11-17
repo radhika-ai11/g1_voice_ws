@@ -327,3 +327,147 @@ def without_gesture(
     the tracking error, which the policy knows from walking, so a raised arm is not an input it has never seen.
     """
     return joint_pos - gesture_offset, joint_vel - gesture_rate
+
+
+# --- the same planner in NumPy, for the CPU (one robot, live scene) --------------------------------------------------
+# Torch spends ~5-10 us of bookkeeping on each tiny operation on the CPU, NumPy ~1 us; the planner is ~150 of them per
+# step. The maths mirrors FootPlanter.step and arm_motion line for line (test_planner_equivalence.py checks them).
+
+import numpy as np  # noqa: E402
+
+
+def _np_rotate(xy: np.ndarray, yaw: np.ndarray) -> np.ndarray:
+    c, s = np.cos(yaw), np.sin(yaw)
+    return np.stack([c * xy[..., 0] - s * xy[..., 1], s * xy[..., 0] + c * xy[..., 1]], -1)
+
+
+def _np_cycle_period(plan: GaitPlan, command: np.ndarray) -> np.ndarray:
+    speed = np.linalg.norm(command[:, :2], axis=1)
+    needed = plan.max_step_m / np.maximum(speed * plan.stance_fraction, 1e-6)
+    return np.clip(needed, plan.min_period_s, plan.period_s)
+
+
+def _np_yaw_pitch_matrix(yaw: np.ndarray, toe_up: np.ndarray) -> np.ndarray:
+    cy, sy = np.cos(yaw), np.sin(yaw)
+    cp, sp = np.cos(-toe_up), np.sin(-toe_up)
+    out = np.zeros(yaw.shape + (3, 3))
+    # Rz(yaw) @ Ry(-toe_up), multiplied out
+    out[..., 0, 0], out[..., 0, 1], out[..., 0, 2] = cy * cp, -sy, cy * sp
+    out[..., 1, 0], out[..., 1, 1], out[..., 1, 2] = sy * cp, cy, sy * sp
+    out[..., 2, 0], out[..., 2, 1], out[..., 2, 2] = -sp, 0.0, cp
+    return out
+
+
+class NumpyFootPlanter:
+    """FootPlanter for the CPU in NumPy: same state, same step(), torch tensors in and out."""
+
+    def __init__(self, plan: GaitPlan, count: int) -> None:
+        self.plan = plan
+        self._nominal = np.stack([np.full(2, plan.foot_x_m), np.array([0.5, -0.5]) * plan.width_m], axis=1)
+        self.feet_world_xy = np.zeros((count, 2, 2))
+        self.feet_world_yaw = np.zeros((count, 2))
+        self._liftoff_xy = np.zeros_like(self.feet_world_xy)
+        self._liftoff_yaw = np.zeros_like(self.feet_world_yaw)
+        self._was_stance = np.ones((count, 2), dtype=bool)
+        self._placed = np.zeros(count, dtype=bool)
+
+    def reset(self, ids=None) -> None:
+        if ids is None:
+            self._placed[:] = False
+        else:
+            self._placed[np.asarray(ids.cpu() if hasattr(ids, "cpu") else ids)] = False
+
+    def step(self, hips_xy, hips_yaw, command, phase, walk_in, hips_velocity=None, com_shift=None) -> FeetPlan:
+        def n(t):
+            return None if t is None else t.detach().double().numpy()
+
+        hips_xy, hips_yaw, command, phase, walk_in = n(hips_xy), n(hips_yaw), n(command), n(phase), n(walk_in)
+        hips_velocity, com_shift = n(hips_velocity), n(com_shift)
+        plan = self.plan
+        new = ~self._placed
+        if new.any():
+            self.feet_world_xy[new] = hips_xy[new][:, None] + _np_rotate(self._nominal, hips_yaw[new, None])
+            self.feet_world_yaw[new] = np.repeat(hips_yaw[new][:, None], 2, axis=1)
+            self._was_stance[new] = True
+            self._placed[new] = True
+
+        period = _np_cycle_period(plan, command)
+        stance_time = period * plan.stance_fraction
+        amount = np.clip(walk_in, 0.0, 1.0)
+        foot_phase = np.stack([phase, np.remainder(phase + 0.5, 1.0)], axis=1)
+        stance = (foot_phase < plan.stance_fraction) | (amount <= 0)[:, None]
+        stance_progress = np.clip(foot_phase / plan.stance_fraction, 0, 1)
+        swing_progress = np.clip((foot_phase - plan.stance_fraction) / (1 - plan.stance_fraction), 0, 1)
+        smooth = (1 - np.cos(np.pi * swing_progress)) / 2
+
+        lifting = self._was_stance & ~stance
+        self._liftoff_xy = np.where(lifting[..., None], self.feet_world_xy, self._liftoff_xy)
+        self._liftoff_yaw = np.where(lifting, self.feet_world_yaw, self._liftoff_yaw)
+
+        planted = _np_rotate(self.feet_world_xy - hips_xy[:, None], -hips_yaw[:, None])
+        planted = planted - _np_rotate(self._nominal[None], self.feet_world_yaw - hips_yaw[:, None])
+        weights = stance.astype(float)
+        middle_y = (planted[..., 1] * weights).sum(1) / np.maximum(weights.sum(1), 1.0)
+
+        remaining = (1 - swing_progress) * ((1 - plan.stance_fraction) * period * amount)[:, None]
+        velocity = _np_rotate(command[:, :2], hips_yaw)[:, None]
+        hips_at_landing = hips_xy[:, None] + velocity * remaining[..., None]
+        yaw_at_landing = hips_yaw[:, None] + command[:, 2:3] * remaining
+        half_turn = (0.5 * command[:, 2] * stance_time * amount)[:, None]
+        half_step = (0.5 * command[:, :2] * (stance_time * amount)[:, None])[:, None]
+        landing_relative = _np_rotate(self._nominal[None], half_turn) + half_step
+        landing_relative = landing_relative + np.stack([np.zeros_like(middle_y), middle_y], -1)[:, None]
+        landing_xy = hips_at_landing + _np_rotate(landing_relative, yaw_at_landing)
+        if hips_velocity is not None:
+            surplus = hips_velocity - velocity[:, 0]
+            catch = np.clip(plan.catch_gain_s * surplus, -plan.max_catch_step_m, plan.max_catch_step_m)
+            landing_xy = landing_xy + (catch * amount[:, None])[:, None]
+        landing_yaw = yaw_at_landing + half_turn
+
+        turn_left = np.remainder(landing_yaw - self._liftoff_yaw + np.pi, 2 * np.pi) - np.pi
+        swing_xy = self._liftoff_xy + (landing_xy - self._liftoff_xy) * smooth[..., None]
+        swing_yaw = self._liftoff_yaw + turn_left * smooth
+        self.feet_world_xy = np.where(stance[..., None], self.feet_world_xy, swing_xy)
+        self.feet_world_yaw = np.where(stance, self.feet_world_yaw, swing_yaw)
+        self._was_stance = stance
+
+        relative_xy = _np_rotate(self.feet_world_xy - hips_xy[:, None], -hips_yaw[:, None])
+        sway = plan.hip_sway_m * amount * np.sin(2 * np.pi * (phase - 0.05))
+        hips_offset = np.stack([np.zeros_like(middle_y), middle_y + sway], axis=1)
+        if com_shift is not None:
+            hips_offset = hips_offset - np.clip(com_shift, -plan.max_com_shift_m, plan.max_com_shift_m)
+        relative_xy = relative_xy - hips_offset[:, None]
+        lift = np.where(stance, 0.0, np.sin(np.pi * swing_progress))
+        height = plan.stand_foot_z_m + (plan.foot_z_m - plan.stand_foot_z_m) * amount
+        z = height[:, None] + plan.step_height_m * lift * amount[:, None]
+        tilt = np.where(stance, np.clip(1 - stance_progress / 0.15, 0, 1),
+                        np.clip((swing_progress - 0.6) / 0.4, 0, 1)) * plan.heel_tilt_rad * amount[:, None]
+
+        def t(a, dtype=torch.float32):
+            return torch.from_numpy(np.ascontiguousarray(a)).to(dtype)
+
+        return FeetPlan(
+            position=t(np.concatenate([relative_xy, z[..., None]], axis=-1)),
+            rotation=t(_np_yaw_pitch_matrix(self.feet_world_yaw - hips_yaw[:, None], tilt)),
+            stance=torch.from_numpy(stance.copy()),
+            hips_offset=t(hips_offset),
+        )
+
+
+def np_arm_motion(plan: GaitPlan, phase, command, walk_in) -> tuple[torch.Tensor, torch.Tensor]:
+    """arm_motion in NumPy (torch tensors in and out, on the CPU)."""
+    phase, command, walk_in = (x.detach().double().numpy() for x in (phase, command, walk_in))
+    foot_phase = np.stack([phase, np.remainder(phase + 0.5, 1.0)], axis=1)
+    on_ground = foot_phase < plan.stance_fraction
+    stance_progress = foot_phase / plan.stance_fraction
+    swing_progress = np.clip((foot_phase - plan.stance_fraction) / (1 - plan.stance_fraction), 0, 1)
+    smooth = (1 - np.cos(np.pi * swing_progress)) / 2
+    along = np.where(on_ground, 0.5 - stance_progress, -0.5 + smooth)
+    direction = np.where(command[:, 0] < -plan.moving_threshold, -1.0, 1.0)
+    leg_forward = 2 * along * direction[:, None]
+    speed = np.linalg.norm(command[:, :2], axis=1)
+    walking_share = np.clip(speed / plan.full_swing_speed, 0.0, 1.0)
+    size = np.clip(walk_in, 0, 1) * (0.35 + 0.65 * np.maximum(walking_share, 0.5) * (speed > plan.moving_threshold))
+    shoulder = -plan.arm_swing_rad * size[:, None] * leg_forward
+    elbow = -plan.elbow_swing_rad * size[:, None] * (leg_forward + 1) / 2
+    return torch.from_numpy(shoulder).float(), torch.from_numpy(elbow).float()

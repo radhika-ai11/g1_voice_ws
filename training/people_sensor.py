@@ -59,15 +59,35 @@ def configure_people_bodies(env_cfg, count: int) -> None:
 
 
 class PeopleBodies:
-    """Moves the capsules to where the people are (call every physics step)."""
+    """Moves the capsules to where the people are (call every physics step).
+
+    Only capsules that moved are written to the physics: parked people, and people standing still, cost nothing."""
+
+    MOVE_EPSILON_M = 1e-3
+    NEAR_M = 3.0  # people this close to the robot are moved every step; farther ones (who cannot touch it) less often
+    FAR_EVERY = 10  # steps between moves of the far ones (5 times a second at 50 Hz)
 
     def __init__(self, scene, count: int) -> None:
         import torch
 
         self._torch = torch
         self._bodies = [scene[f"person_body_{n}"] for n in range(count)]
+        self._last: list[tuple[float, float, float] | None] = [None] * count
+        # one pose tensor per capsule, reused every step (x, y, z, qx, qy, qz, qw)
+        self._step = 0
+        self._poses = [torch.tensor([[0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]], device=body.device) for body in self._bodies]
 
-    def update(self, people: Sequence[World]) -> None:
-        for body, (x, y, z) in zip(self._bodies, body_positions(people)):
-            pose = self._torch.tensor([[x, y, z, 0.0, 0.0, 0.0, 1.0]], device=body.device)  # (x, y, z, qx, qy, qz, qw)
+    def update(self, people: Sequence[World], robot_xy: tuple[float, float] | None = None) -> None:
+        self._step += 1
+        far_turn = self._step % self.FAR_EVERY == 0
+        for n, (body, position) in enumerate(zip(self._bodies, body_positions(people))):
+            last = self._last[n]
+            if last is not None and max(abs(a - b) for a, b in zip(position, last)) < self.MOVE_EPSILON_M:
+                continue
+            if (robot_xy is not None and not far_turn and last is not None
+                    and math.hypot(position[0] - robot_xy[0], position[1] - robot_xy[1]) > self.NEAR_M):
+                continue  # far from the robot: moved on the next far turn
+            pose = self._poses[n]
+            pose[0, :3] = self._torch.tensor(position)  # one copy to the device
             body.write_root_pose_to_sim_index(root_pose=pose)
+            self._last[n] = position

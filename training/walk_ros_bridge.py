@@ -55,8 +55,21 @@ class WalkRosBridge:
         self._executor.add_node(self._node)
 
     def spin_once(self) -> None:
-        """Handle pending ROS messages without waiting."""
-        self._executor.spin_once(timeout_sec=0.0)
+        """Handle pending ROS messages without waiting (nothing to do once spin_in_background() was called)."""
+        if getattr(self, "_spin_thread", None) is None:
+            self._executor.spin_once(timeout_sec=0.0)
+
+    def spin_in_background(self) -> None:
+        """Handle incoming messages on a thread of their own: polling for them cost the sim loop ~1 ms per step.
+        The callbacks only store what arrived, under the lock; the loop reads it with the getters as before."""
+        self._spin_thread = threading.Thread(target=self._spin, name="ros-spin", daemon=True)
+        self._spin_thread.start()
+
+    def _spin(self) -> None:
+        try:
+            self._executor.spin()
+        except Exception:  # shutting down
+            pass
 
     def _on_cmd_vel(self, msg: Twist) -> None:
         command = (msg.linear.x, msg.linear.y, msg.angular.z)
@@ -74,11 +87,13 @@ class WalkRosBridge:
             self._visit_requests.append(msg.data.strip().lower())
 
     def _on_reset(self, _msg: String) -> None:
-        self._resets += 1
+        with self._lock:
+            self._resets += 1
 
     def reset_requested(self) -> bool:
         """Whether a new round asked for the robot to start again from its place at the stall."""
-        requested, self._resets = self._resets > 0, 0
+        with self._lock:
+            requested, self._resets = self._resets > 0, 0
         return requested
 
     def publish_people(self, people: list[tuple[float, float]]) -> None:
@@ -99,6 +114,19 @@ class WalkRosBridge:
         with self._lock:
             requests, self._show_requests = self._show_requests, []
         return requests
+
+    def publish_image_in_background(self, sim_time_s: float, rgb) -> bool:
+        """publish_image on a worker thread, so the simulation does not wait for the ~1 MB copy and serialisation.
+        Returns False (the image is dropped) while the previous one is still being sent."""
+        import concurrent.futures
+
+        if getattr(self, "_image_worker", None) is None:
+            self._image_worker = concurrent.futures.ThreadPoolExecutor(1, thread_name_prefix="camera-publish")
+            self._image_job = None
+        if self._image_job is not None and not self._image_job.done():
+            return False
+        self._image_job = self._image_worker.submit(self.publish_image, sim_time_s, rgb)
+        return True
 
     def publish_image(self, sim_time_s: float, rgb) -> None:
         """Publish a head camera image (H x W x 3 uint8 array) as sensor_msgs/Image (rgb8)."""
@@ -157,5 +185,8 @@ class WalkRosBridge:
         self._odom_pub.publish(odom)
 
     def shutdown(self) -> None:
+        self._executor.shutdown(timeout_sec=1.0)
+        if getattr(self, "_image_worker", None) is not None:
+            self._image_worker.shutdown(wait=True)  # the last image is sent before the node goes
         self._node.destroy_node()
         rclpy.try_shutdown()

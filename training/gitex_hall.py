@@ -45,6 +45,8 @@ BRANDS = [(0.0, 0.55, 0.6), (0.9, 0.45, 0.05), (0.15, 0.6, 0.25), (0.8, 0.12, 0.
 HELD_COLOURS = {"apple": (0.72, 0.06, 0.06), "banana": (0.95, 0.85, 0.2), "mug": (0.8, 0.12, 0.1),
                 "bottle": (0.95, 0.78, 0.08), "scissors": (0.15, 0.3, 0.8)}
 HIDDEN_Z = -50.0  # where things not in the hall wait (under the floor)
+FAR_VISITOR_M = 8.0  # visitors farther than this from the robot are small in its head camera
+FAR_POSE_EVERY = 4  # ... so their walking pose is refreshed there every 4th camera frame (their place every frame)
 SCREEN_CONTENT = [(0.15, 0.55, 0.95), (0.95, 0.35, 0.55), (0.25, 0.85, 0.65), (0.98, 0.7, 0.2)]
 OUTFITS = [  # shoes, trousers, shirt, skin
     ((0.1, 0.1, 0.1), (0.15, 0.2, 0.35), (0.9, 0.9, 0.92), (0.87, 0.68, 0.55)),
@@ -234,12 +236,38 @@ class GitexHall:
         self._colour_groups = visitor_colour_groups(self._cycle.indices, self._cycle.regions,
                                                     [OUTFITS[n % len(OUTFITS)] for n in range(count + 1)], points_each)
         self._all_points = np.zeros(((count + 1) * points_each, 3), dtype=np.float32)
+        # their normals too: computed once per body shape (walk-cycle frame), then only turned with the visitor,
+        # so the viewer does not recompute every visitor's normals at every redraw
+        self._all_normals = np.zeros_like(self._all_points)
+        self._all_normals[:, 2] = 1.0
+        self._shape_normals: dict[object, np.ndarray] = {}
         self._last_frames: dict[int, int] = {}
         self._time = 0.0
         self._static_logged = False
         if newton is not None and getattr(newton, "_viewer", None) is not None:
             newton._viewer.show_ui = False  # the whole hall in view; press H in the viewer for its controls
         self._textured: list[str] = []  # textured product meshes whose texturing is turned on once they exist
+        # the head camera's view of far visitors: their walking pose is refreshed in the stage only every
+        # FAR_POSE_EVERY camera frames (they are a few pixels tall there); their place is updated every frame
+        self.robot_xy: tuple[float, float] | None = None  # set by the scene before each step
+        self._stage_updates = 0
+        self._viewer_indices: dict[str, object] = {}  # each mesh's triangles on the GPU, sent once (they never change)
+        self._held_hidden: set[str] = set()  # held objects already hidden in the viewer (no need to send them again)
+        # with the viewer in its own process, the visitors' meshes are built there: here only each visitor's place,
+        # heading and body shape are recorded (rows of x, y, yaw, shape, visible), and the held object's pose
+        self._remote = bool(getattr(newton, "builds_people", False))
+        if self._remote:
+            shapes = list(self._cycle.frames) + [self._hold_points]  # body shapes: the walk cycle, then holding out
+            self._hold_shape = len(shapes) - 1
+            newton.setup_people(
+                np.stack([np.asarray(points, dtype=np.float32) for points in shapes]),
+                np.stack([vertex_normals(points, self._cycle.indices) for points in shapes]),
+                self._colour_groups, count + 1,
+                [(name, points, indices, HELD_COLOURS[name]) for name, (_p, _o, points, indices) in self._held.items()],
+            )
+            self._people_rows = np.zeros((count + 1, 5), dtype=np.float32)
+            self._held_row = np.full(5, -1.0, dtype=np.float32)  # held object number, centre x, y, z, yaw
+            self._held_names = list(self._held)
 
     # --- the stage ---
 
@@ -422,6 +450,13 @@ class GitexHall:
                 prim.MakeVisible() if other == name else prim.MakeInvisible()
             self._shown_held = name
         c, s = math.cos(pose.yaw), math.sin(pose.yaw)
+        if viewer and self._remote:
+            if name is None:
+                self._held_row[0] = -1.0
+            else:
+                centre = hand_world + np.array([0.0, 0.0, 0.04])
+                self._held_row[:] = (self._held_names.index(name), centre[0], centre[1], centre[2], pose.yaw)
+            viewer = False  # the meshes are built in the viewer process
         for other, (path, offset, points, indices) in self._held.items():
             centre = hand_world + np.array([0.0, 0.0, 0.04]) if other == name else np.array([0.0, 0.0, HIDDEN_Z])
             if stage and other == name:
@@ -430,6 +465,11 @@ class GitexHall:
                 ops[0].Set(Gf.Vec3d(*(centre - turned).tolist()))
                 ops[1].Set(math.degrees(pose.yaw))
             if viewer and self._newton is not None:
+                if other != name and other in self._held_hidden:
+                    continue  # still hidden where it was: nothing to send
+                self._held_hidden.discard(other)
+                if other != name:
+                    self._held_hidden.add(other)
                 world = np.empty_like(points)
                 world[:, 0] = centre[0] + c * points[:, 0] - s * points[:, 1]
                 world[:, 1] = centre[1] + s * points[:, 0] + c * points[:, 1]
@@ -439,14 +479,28 @@ class GitexHall:
     # --- the Newton viewer ---
 
     def _log(self, name: str, points: np.ndarray, indices: np.ndarray, colour, roughness=0.7, uvs=None,
-             texture=None, dynamic: bool = False) -> None:
+             texture=None, dynamic: bool = False, normals: np.ndarray | None = None) -> None:
+        if getattr(self._newton, "accepts_numpy", False):  # the viewer in its own process (viewer_process.py)
+            self._newton.log_mesh(name, points, indices, colour, roughness, uvs=uvs, texture=texture, dynamic=dynamic,
+                                  normals=normals)
+            return
         import warp as wp
 
-        device = "cuda:0" if wp.is_cuda_available() else "cpu"
+        # the viewer's own device (the sim may run on the CPU): mixing devices crashes Warp
+        device = getattr(getattr(self._newton, "_viewer", None), "device", None) or (
+            "cuda:0" if wp.is_cuda_available() else "cpu")
+        # moving meshes (visitors, held objects) keep their triangles: send those to the GPU once, not every frame
+        index_array = self._viewer_indices.get(name) if dynamic else None
+        if index_array is None or len(index_array) != len(indices):
+            index_array = wp.array(np.ascontiguousarray(indices, dtype=np.int32), dtype=wp.int32, device=device)
+            if dynamic:
+                self._viewer_indices[name] = index_array
         self._newton.log_mesh(
             name,
             wp.array(np.ascontiguousarray(points, dtype=np.float32), dtype=wp.vec3, device=device),
-            wp.array(np.ascontiguousarray(indices, dtype=np.int32), dtype=wp.int32, device=device),
+            index_array,
+            normals=None if normals is None else wp.array(np.ascontiguousarray(normals, dtype=np.float32),
+                                                          dtype=wp.vec3, device=device),
             uvs=None if uvs is None else wp.array(np.ascontiguousarray(uvs, dtype=np.float32), dtype=wp.vec2, device=device),
             texture=texture, color=tuple(colour), roughness=roughness, dynamic=dynamic, backface_culling=False,
         )
@@ -490,6 +544,8 @@ class GitexHall:
                 self._enable_texture(name)
         if not (stage or (viewer and self._newton is not None)):
             return
+        if stage:
+            self._stage_updates += 1
         for n, (visitor, path, texture) in enumerate(self._visitors):
             x, y, yaw, frame = visitor.pose(self._time)
             points = self._cycle.frames[frame]
@@ -497,20 +553,37 @@ class GitexHall:
                 ops = UsdGeom.Xformable(self._stage.GetPrimAtPath(path)).GetOrderedXformOps()
                 ops[0].Set(Gf.Vec3d(x, y, 0.0))
                 ops[1].Set(math.degrees(yaw))
-                if self._last_frames.get(n) != frame:
+                far = self.robot_xy is not None and math.hypot(x - self.robot_xy[0], y - self.robot_xy[1]) > FAR_VISITOR_M
+                if self._last_frames.get(n) != frame and (not far or self._stage_updates % FAR_POSE_EVERY == 0):
                     body = UsdGeom.Mesh(self._stage.GetPrimAtPath(f"{path}/model/body"))
                     body.GetPointsAttr().Set(Vt.Vec3fArray.FromNumpy(points))
                     self._last_frames[n] = frame
-            if viewer and self._newton is not None:
+            if viewer and self._remote:
+                self._people_rows[n] = (x, y, yaw, frame, 1.0)
+            elif viewer and self._newton is not None:
                 c, s = math.cos(yaw), math.sin(yaw)
                 world = self._all_points[n * len(points):(n + 1) * len(points)]
                 world[:, 0] = x + c * points[:, 0] - s * points[:, 1]
                 world[:, 1] = y + s * points[:, 0] + c * points[:, 1]
                 world[:, 2] = points[:, 2]
+                self._turn_normals(n, frame, points, c, s)
         self._step_stall_visitor(stage, viewer)
-        if viewer and self._newton is not None and self._visitors:
+        if viewer and self._remote:
+            self._newton.publish_people(self._people_rows, self._held_row)
+        elif viewer and self._newton is not None and self._visitors:
             for number, (colour, vertex_ids, local) in enumerate(self._colour_groups):
-                self._log(f"/gitex/visitors_{number}", self._all_points[vertex_ids], local, colour, 0.8, dynamic=True)
+                self._log(f"/gitex/visitors_{number}", self._all_points[vertex_ids], local, colour, 0.8, dynamic=True,
+                          normals=self._all_normals[vertex_ids])
+
+    def _turn_normals(self, n: int, key, points: np.ndarray, c: float, s: float) -> None:
+        """Visitor ``n``'s normals in the world: its body shape's normals (computed once), turned by its heading."""
+        local = self._shape_normals.get(key)
+        if local is None:
+            local = self._shape_normals[key] = vertex_normals(points, self._cycle.indices)
+        out = self._all_normals[n * len(points):(n + 1) * len(points)]
+        out[:, 0] = c * local[:, 0] - s * local[:, 1]
+        out[:, 1] = s * local[:, 0] + c * local[:, 1]
+        out[:, 2] = local[:, 2]
 
     def _step_stall_visitor(self, stage: bool, viewer: bool) -> None:
         from pxr import Gf, UsdGeom, Vt
@@ -524,6 +597,8 @@ class GitexHall:
                 UsdGeom.Imageable(self._stage.GetPrimAtPath(path)).MakeInvisible()
                 self._last_frames[n] = "gone"
             world[:, 2] = HIDDEN_Z
+            if self._remote:
+                self._people_rows[n, 4] = 0.0  # not there
             self._move_held(pose, np.zeros(3), stage, viewer)
             return
         points, key, hand = self._stall_visitor_points(pose)
@@ -539,10 +614,13 @@ class GitexHall:
                 UsdGeom.Mesh(self._stage.GetPrimAtPath(f"{path}/model/body")).GetPointsAttr().Set(
                     Vt.Vec3fArray.FromNumpy(np.ascontiguousarray(points, dtype=np.float32)))
                 self._last_frames[n] = key
-        if viewer:
+        if viewer and self._remote:
+            self._people_rows[n] = (pose.x, pose.y, pose.yaw, self._hold_shape if key == "hold" else key, 1.0)
+        elif viewer:
             world[:, 0] = pose.x + c * points[:, 0] - s * points[:, 1]
             world[:, 1] = pose.y + s * points[:, 0] + c * points[:, 1]
             world[:, 2] = points[:, 2]
+            self._turn_normals(n, key, points, c, s)
         hand_world = np.array([pose.x + c * hand[0] - s * hand[1], pose.y + s * hand[0] + c * hand[1], hand[2]])
         self._move_held(pose, hand_world, stage, viewer)
 
@@ -557,6 +635,19 @@ class GitexHall:
         if mesh is not None and mesh.material[3] != 1.0:
             roughness, metallic, checker, _ = mesh.material
             mesh.material = (roughness, metallic, checker, 1.0)
+
+
+def vertex_normals(points: np.ndarray, indices: np.ndarray) -> np.ndarray:
+    """Unit vertex normals (N, 3) of a triangle mesh: the area-weighted sum of the faces around each vertex."""
+    triangles = np.asarray(indices).reshape(-1, 3)
+    corners = np.asarray(points, dtype=np.float64)[triangles]
+    faces = np.cross(corners[:, 1] - corners[:, 0], corners[:, 2] - corners[:, 0])  # length = 2 x area
+    normals = np.zeros((len(points), 3))
+    for k in range(3):
+        np.add.at(normals, triangles[:, k], faces)
+    length = np.linalg.norm(normals, axis=1, keepdims=True)
+    normals = np.where(length > 1e-12, normals / np.maximum(length, 1e-12), np.array([0.0, 0.0, 1.0]))
+    return normals.astype(np.float32)
 
 
 def visitor_colour_groups(indices: np.ndarray, regions: np.ndarray, outfits: list, points_each: int) -> list[tuple]:

@@ -20,6 +20,7 @@ from isaaclab.envs.mdp.actions.joint_actions import JointPositionAction
 from isaaclab.utils import configclass
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+from foot_placement.gait_planner import NumpyFootPlanter, np_arm_motion  # noqa: E402
 from foot_placement.gait_planner import FeetPlan, FootPlanter, GaitPlan, arm_motion, cycle_period, move_toward, needs_to_step, step_walk_in, swing_on_arm_pose  # noqa: E402
 from foot_placement.leg_kinematics import LegKinematics  # noqa: E402
 
@@ -46,7 +47,10 @@ class PlanFollowingAction(JointPositionAction):
         plan_device = cfg.plan_device or self.device
         self._plan_device = plan_device
         self._legs = [LegKinematics.from_urdf(URDF, side).to(plan_device) for side in ("left", "right")]
-        self.planter = FootPlanter(self.plan_cfg, self.num_envs, device=plan_device)
+        # on the CPU (one robot, live) the planner runs in NumPy: the same maths with ~10x less overhead per operation
+        self._numpy_plan = str(plan_device) == "cpu"
+        self.planter = (NumpyFootPlanter(self.plan_cfg, self.num_envs) if self._numpy_plan
+                        else FootPlanter(self.plan_cfg, self.num_envs, device=plan_device))
         self._phase = torch.full((self.num_envs,), self.plan_cfg.stance_fraction, device=plan_device)
         self._walk_in = torch.zeros(self.num_envs, device=plan_device)
         standing = torch.cat([leg.default_angles() for leg in self._legs], dim=1)  # (1, 12)
@@ -107,7 +111,7 @@ class PlanFollowingAction(JointPositionAction):
                 feet.position[:, index], feet.rotation[:, index], self._reference[:, columns],
                 iterations=self.cfg.ik_iterations, safe=True,  # a far target never flips the leg
             )
-        shoulder, elbow = arm_motion(plan, self._phase, command, ramp)
+        shoulder, elbow = (np_arm_motion if self._numpy_plan else arm_motion)(plan, self._phase, command, ramp)
         swing = torch.cat([shoulder, elbow], dim=1).to(self.device)
         self.arm_targets = swing_on_arm_pose(self.arm_pose, self._arm_neutral, swing)
         self.phase = self._phase.to(self.device)

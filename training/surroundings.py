@@ -28,7 +28,8 @@ SHOWABLE = {  # name: USD (None = built here), rotation about X that stands it t
     "drill": (f"{YCB}/035_power_drill.usd", 90.0),
     "scissors": (f"{YCB}/037_scissors.usd", 0.0),
 }
-CAMERA_PERIOD_S = 0.2  # 5 images a second
+CAMERA_PERIOD_S = 0.3  # 3.3 images a second: above what the vision node uses (3 a second by default, 1.5 in the
+# stall demo); each image costs the sim a ~30 ms render, so more would only be thrown away
 WALK_SPEED = 1.0  # m/s, people
 PASS_HALF_LENGTH = 4.0  # people walk from 4 m on one side of the robot to 4 m on the other
 PASS_DISTANCE = (1.5, 3.5)  # how far in front of the robot they pass (m)

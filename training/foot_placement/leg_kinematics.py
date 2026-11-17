@@ -10,6 +10,7 @@ from __future__ import annotations
 import xml.etree.ElementTree as ElementTree
 from dataclasses import dataclass
 
+import numpy as np
 import torch
 
 LEG_JOINTS = ("hip_pitch", "hip_roll", "hip_yaw", "knee", "ankle_pitch", "ankle_roll")
@@ -22,6 +23,7 @@ STANDING = {"hip_pitch": -0.25, "knee": 0.5, "ankle_pitch": -0.25}
 WALKING_RANGE = {"hip_pitch": (-1.4, 0.7), "hip_roll": (-0.5, 0.5), "hip_yaw": (-0.6, 0.6), "knee": (-0.2, 2.0),
                  "ankle_pitch": (-0.9, 0.6), "ankle_roll": (-0.3, 0.3)}
 MAX_JOINT_STEP_RAD = 0.15  # per solve (one 20 ms control step): 7.5 rad/s
+CONVERGED_ERROR = 1e-5  # m and rad: IK on the CPU stops iterating once the foot is this close to its target
 REACH_FRACTION = 1.0  # targets beyond the farthest reachable point are pulled in to it
 
 
@@ -153,6 +155,8 @@ class LegKinematics:
         ``safe`` (for walking): the target is pulled in to the leg's reach, the joints stay in WALKING_RANGE and
         move at most MAX_JOINT_STEP_RAD, so a far target gives the closest sensible leg, never a flipped one.
         """
+        if target_position.device.type == "cpu":  # one robot, live: the same solver in NumPy (~10x less overhead)
+            return self._solve_numpy(target_position, target_rotation, start, iterations, damping, safe)
         start = start.expand(target_position.shape[0], 6)
         angles = start.clone()
         lower, upper = (self.walking_lower, self.walking_upper) if safe else (self.lower_limits, self.upper_limits)
@@ -163,9 +167,15 @@ class LegKinematics:
             target_position = hip + offset * (distance.clamp(max=self.reach) / distance)  # pulled in to the reach
             angles = torch.clamp(angles, lower, upper)
         identity = torch.eye(6, device=angles.device)
+        # On the CPU (one robot, live scene) stop as soon as every foot is on target: warm-started from the last
+        # step, that is usually after 1-2 iterations. On the GPU (training) the check would stall the GPU every
+        # iteration, so the fixed number of iterations is kept there.
+        early_exit = angles.device.type == "cpu"
         for _ in range(iterations):
             position, rotation, axes, points = self._forward(angles)
             error = torch.cat([target_position - position, rotation_error(rotation, target_rotation)], dim=1)
+            if early_exit and float(error.abs().max()) < CONVERGED_ERROR:
+                break
             linear = torch.cross(axes, position.unsqueeze(1) - points, dim=-1)  # (N, 6, 3)
             jacobian = torch.cat([linear, axes], dim=-1).transpose(1, 2)  # (N, 6 task, 6 joints)
             step = jacobian.transpose(1, 2) @ torch.linalg.solve(
@@ -175,3 +185,91 @@ class LegKinematics:
         if safe:
             angles = start + (angles - start).clamp(-MAX_JOINT_STEP_RAD, MAX_JOINT_STEP_RAD)
         return angles
+
+
+# --- the same IK in NumPy, for the CPU (one robot, live scene) -------------------------------------------------------
+# Torch spends ~5-10 us of bookkeeping on every tiny operation on the CPU; NumPy ~1 us. The maths is the same as
+# LegKinematics.solve above (test_ik_equivalence.py checks the two agree).
+
+def _np_axis_angle(axis: np.ndarray, angle: np.ndarray) -> np.ndarray:
+    """Rotation matrices (N, 3, 3) about unit ``axis`` (3,) by ``angle`` (N,) (Rodrigues)."""
+    x, y, z = axis
+    c, s = np.cos(angle), np.sin(angle)
+    t = 1 - c
+    out = np.empty((len(angle), 3, 3))
+    out[:, 0, 0], out[:, 0, 1], out[:, 0, 2] = t * x * x + c, t * x * y - s * z, t * x * z + s * y
+    out[:, 1, 0], out[:, 1, 1], out[:, 1, 2] = t * x * y + s * z, t * y * y + c, t * y * z - s * x
+    out[:, 2, 0], out[:, 2, 1], out[:, 2, 2] = t * x * z - s * y, t * y * z + s * x, t * z * z + c
+    return out
+
+
+def _np_rotation_error(rotation: np.ndarray, target: np.ndarray) -> np.ndarray:
+    error = target @ np.swapaxes(rotation, -1, -2)
+    skew = np.stack([error[:, 2, 1] - error[:, 1, 2], error[:, 0, 2] - error[:, 2, 0], error[:, 1, 0] - error[:, 0, 1]], -1)
+    cos_angle = np.clip((np.trace(error, axis1=1, axis2=2) - 1) / 2, -1.0, 1.0)
+    angle = np.arccos(cos_angle)
+    sin_angle = np.sin(angle)
+    scale = np.where(sin_angle > 1e-6, angle / (2 * np.maximum(sin_angle, 1e-12)), 0.5)
+    return skew * scale[:, None]
+
+
+def _np_constants(leg: "LegKinematics") -> dict:
+    cached = getattr(leg, "_np", None)
+    if cached is None:
+        def as_np(tensor):
+            return tensor.detach().cpu().double().numpy()
+
+        cached = leg._np = {
+            "origins": [as_np(j.origin_position) for j in leg._joints],
+            "rotations": [as_np(j.origin_rotation) for j in leg._joints],
+            "axes": [as_np(j.axis) for j in leg._joints],
+            "lower": as_np(leg.lower_limits), "upper": as_np(leg.upper_limits),
+            "walking_lower": as_np(leg.walking_lower), "walking_upper": as_np(leg.walking_upper),
+            "hip": as_np(leg.hip_position()),
+        }
+    return cached
+
+
+def _np_forward(k: dict, angles: np.ndarray):
+    count = angles.shape[0]
+    position = np.zeros((count, 3))
+    rotation = np.broadcast_to(np.eye(3), (count, 3, 3))
+    axes, points = [], []
+    for index in range(6):
+        position = position + rotation @ k["origins"][index]
+        rotation = rotation @ k["rotations"][index]
+        axes.append(rotation @ k["axes"][index])
+        points.append(position)
+        rotation = rotation @ _np_axis_angle(k["axes"][index], angles[:, index])
+    return position, rotation, np.stack(axes, 1), np.stack(points, 1)
+
+
+def _solve_numpy(self, target_position, target_rotation, start, iterations, damping, safe):
+    k = _np_constants(self)
+    target_p = target_position.detach().double().numpy()
+    target_r = target_rotation.detach().double().numpy()
+    start_np = np.broadcast_to(start.detach().double().numpy(), (target_p.shape[0], 6)).copy()
+    angles = start_np.copy()
+    lower, upper = (k["walking_lower"], k["walking_upper"]) if safe else (k["lower"], k["upper"])
+    if safe:
+        offset = target_p - k["hip"]
+        distance = np.maximum(np.linalg.norm(offset, axis=1, keepdims=True), 1e-6)
+        target_p = k["hip"] + offset * (np.minimum(distance, self.reach) / distance)
+        angles = np.clip(angles, lower, upper)
+    regulariser = damping**2 * np.eye(6)
+    for _ in range(iterations):
+        position, rotation, axes, points = _np_forward(k, angles)
+        error = np.concatenate([target_p - position, _np_rotation_error(rotation, target_r)], axis=1)
+        if np.abs(error).max() < CONVERGED_ERROR:
+            break
+        linear = np.cross(axes, position[:, None, :] - points)
+        jacobian = np.swapaxes(np.concatenate([linear, axes], axis=-1), 1, 2)  # (N, 6 task, 6 joints)
+        jt = np.swapaxes(jacobian, 1, 2)
+        step = jt @ np.linalg.solve(jacobian @ jt + regulariser, error[..., None])
+        angles = np.clip(angles + step[..., 0], lower, upper)
+    if safe:
+        angles = start_np + np.clip(angles - start_np, -MAX_JOINT_STEP_RAD, MAX_JOINT_STEP_RAD)
+    return torch.from_numpy(angles).to(dtype=start.dtype)
+
+
+LegKinematics._solve_numpy = _solve_numpy
